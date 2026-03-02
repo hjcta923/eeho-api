@@ -1,3 +1,7 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()  # .env 파일에서 환경변수 로드 (로컬 개발용, Cloud Run에서는 무시됨)
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 import json
@@ -9,19 +13,24 @@ from vertexai.generative_models import GenerativeModel
 app = FastAPI(title="EEHO AI API", version="0.2")
 
 # ============================================================
-# 설정
+# 설정 (환경변수에서 로드)
 # ============================================================
-PINECONE_API_KEY = "pcsk_5p2m3k_6vU1BHznUnFiiZT2xpXov2Y9Hpx7KqG1dXRBkmmZVLyS4kcQgg9aAceNcDMwcti"
-BUCKET_NAME = "eeho-tax-knowledge-base-01"
-GUIDE_PATH = "실무서가이드/yangdo_2025_guide.json"
+PINECONE_API_KEY = os.environ.get("PINECONE_API_KEY", "")
+BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "eeho-tax-knowledge-base-01")
+GUIDE_PATH = os.environ.get("GUIDE_PATH", "실무서가이드/yangdo_2025_guide.json")
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
+GCP_LOCATION = os.environ.get("GCP_LOCATION", "us-central1")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-001")
+PINECONE_INDEX_NAME = os.environ.get("PINECONE_INDEX_NAME", "eeho-tax-cases")
+KAKAO_CHANNEL_URL = os.environ.get("KAKAO_CHANNEL_URL", "https://pf.kakao.com/YOUR_CHANNEL_ID")
 
 # Pinecone
 pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index("eeho-tax-cases")
+index = pc.Index(PINECONE_INDEX_NAME)
 
 # Gemini
-vertexai.init(project="project-9fb5ee59-ec65-4d2a-aa6", location="us-central1")
-gemini = GenerativeModel("gemini-2.0-flash-001")
+vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION)
+gemini = GenerativeModel(GEMINI_MODEL)
 
 # ============================================================
 # 요청 모델
@@ -433,7 +442,7 @@ async def report(req: ReportRequest):
         "면책안내": "본 분석은 참고용이며, 해당 조문의 적용 가능 여부 및 정확한 세액은 세무사의 최종 검토가 필요합니다.",
         "상담문의": {
             "안내": "보다 정확한 상담을 원하시면 아래 버튼을 눌러주세요.",
-            "카카오톡채널": "https://pf.kakao.com/YOUR_CHANNEL_ID"
+            "카카오톡채널": KAKAO_CHANNEL_URL
         }
     }
 
