@@ -9,7 +9,6 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
 
-    # Workload Identity Federation 필수 권한
     permissions:
       contents: read
       id-token: write
@@ -18,7 +17,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # JSON 키 없이 Workload Identity로 GCP 인증
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -31,4 +29,5 @@ jobs:
           service: eeho-ai-api
           region: asia-northeast3
           source: .
+          project_id: eeho-ai-project
           flags: --allow-unauthenticated
