@@ -26,7 +26,9 @@ jobs:
       - name: Deploy to Cloud Run
         uses: google-github-actions/deploy-cloudrun@v2
         with:
-          service: eeho-ai-api
-          region: asia-northeast3
+          service: eeho-api
+          region: us-central1
           source: .
-          flags: --allow-unauthenticated
+          flags: >-
+            --allow-unauthenticated
+            --set-env-vars=PINECONE_API_KEY=${{ secrets.PINECONE_API_KEY }},GCP_PROJECT_ID=project-9fb5ee59-ec65-4d2a-aa6,GCP_LOCATION=us-central1,GCS_BUCKET_NAME=eeho-tax-knowledge-base-01,GUIDE_PATH=실무서가이드/yangdo_2025_guide.json,PINECONE_INDEX_NAME=eeho-tax-cases,GEMINI_MODEL=gemini-2.0-flash-001,KAKAO_CHANNEL_URL=https://pf.kakao.com/lcs4557
