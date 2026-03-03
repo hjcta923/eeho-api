@@ -29,5 +29,4 @@ jobs:
           service: eeho-ai-api
           region: asia-northeast3
           source: .
-          project_id: eeho-ai-project
           flags: --allow-unauthenticated
