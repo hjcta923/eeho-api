@@ -777,3 +777,13 @@ async def test():
 async def test_questions():
     req = QueryRequest(question="부모님을 모시려고 합가했는데 아파트를 팔면 비과세 되나요?")
     return await generate_questions(req)
+
+@app.get("/test-gemini")
+async def test_gemini():
+    try:
+        model = get_gemini()
+        response = model.generate_content("안녕하세요. 테스트입니다. '성공'이라고만 답하세요.")
+        return {"status": "ok", "response": response.text}
+    except Exception as e:
+        import traceback
+        return {"status": "error", "error": str(e), "trace": traceback.format_exc()[-500:]}
