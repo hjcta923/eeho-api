@@ -781,9 +781,11 @@ async def test_questions():
 @app.get("/test-gemini")
 async def test_gemini():
     try:
-        model = get_gemini()
-        response = model.generate_content("안녕하세요. 테스트입니다. '성공'이라고만 답하세요.")
-        return {"status": "ok", "response": response.text}
+        return {
+            "project": GCP_PROJECT_ID,
+            "location": GCP_LOCATION,
+            "model": GEMINI_MODEL,
+            "check": "vars loaded"
+        }
     except Exception as e:
-        import traceback
-        return {"status": "error", "error": str(e), "trace": traceback.format_exc()[-500:]}
+        return {"error": str(e)}
