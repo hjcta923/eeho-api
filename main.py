@@ -494,6 +494,8 @@ async def report(payload: EEHOPayload):
         if lessons:
             error_context = f"\n[과거오류교훈 반드시 반영]\n{json.dumps(lessons,ensure_ascii=False)}\n"
 
+    base_tax = int(cd.estimated_total_tax) if cd.estimated_total_tax > 0 else 0
+
     prompt = f"""당신은 양도소득세 전문 세무사 AI입니다. 최종 분석 리포트를 작성하세요.
 
 고객 상황:
@@ -504,28 +506,42 @@ async def report(payload: EEHOPayload):
   "result_type": "PASS 또는 FAIL 또는 REVIEW",
   "applicable_law": "적용 법령명",
   "law_summary": "법령 핵심 내용 1~2문장",
-  "details": "판단 근거를 3~5문장으로 설명. 비과세 요건 충족 여부, 적용 조문, 판단 이유 포함.",
-  "risk_warning": "주의해야 할 리스크를 2~3문장으로 설명. 미확인 사항, 사후관리 주의점 포함.",
-  "tax_saving": "절세 효과 요약 (예: 약 1억 8,720만원 절감 가능)"
+  "details": "판단 근거를 3~5문장으로 설명. 적용 조문과 판단 이유를 포함하되, 긍정적 측면을 먼저 설명.",
+  "risk_warning": "미충족 또는 불확실한 요건을 2~3문장으로 설명. 충족하지 못한 구체적 요건명을 명시하고 해결 방법을 안내.",
+  "tax_saving": "특례 조문 적용 시 절세 효과 요약 (예: 최대 약 1억 8,720만원 절감 가능)",
+  "confidence_pct": 해당 조문이 실제 적용될 가능성을 0~100 사이 정수. 요건 모두 충족=85~95, 일부 미확인=40~70, 충족 어려움=10~35,
+  "tax_after_applied": 해당 조문이 적용되었을 때의 예상 세액을 원 단위 정수로만 반환. 비과세면 0, 부분감면이면 감면 후 세액 숫자
 }}
-result_type: PASS(비과세요건 충족), FAIL(미충족 명확), REVIEW(추가검토 필요)"""
+result_type: PASS(요건 충족), FAIL(미충족 명확), REVIEW(추가검토 필요)
+confidence_pct와 tax_after_applied는 반드시 숫자(정수)로만 반환."""
 
     r  = model.generate_content(prompt)
     t  = strip_json(r.text)
     try: gr = json.loads(t)
-    except: gr = {"result_type":"REVIEW","details":t[:300],"risk_warning":"","applicable_law":"","law_summary":"","tax_saving":""}
+    except: gr = {"result_type":"REVIEW","details":t[:300],"risk_warning":"","applicable_law":"","law_summary":"","tax_saving":"","confidence_pct":50,"tax_after_applied":0}
+
+    # 타입 보정
+    try:    conf_pct = int(str(gr.get("confidence_pct", 50)).replace("%","").strip())
+    except: conf_pct = 50
+    conf_pct = max(0, min(100, conf_pct))
+
+    try:    tax_after = int(str(gr.get("tax_after_applied", 0)).replace(",","").replace("원","").strip())
+    except: tax_after = 0
 
     # ★ 프론트 기대 형식으로 반환
     return {
-        "status":         "success",
-        "result_type":    gr.get("result_type", "REVIEW"),
-        "applicable_law": gr.get("applicable_law", ""),
-        "law_summary":    gr.get("law_summary", ""),
-        "details":        gr.get("details", ""),
-        "risk_warning":   gr.get("risk_warning", ""),
-        "tax_saving":     gr.get("tax_saving", ""),
-        "면책안내":        "본 분석은 참고용이며, 정확한 세액은 세무사의 최종 검토가 필요합니다.",
-        "상담문의":        {"안내": "더 정확한 상담을 원하시면 아래 버튼을 눌러주세요.", "카카오톡채널": KAKAO_CHANNEL_URL}
+        "status":            "success",
+        "result_type":       gr.get("result_type", "REVIEW"),
+        "applicable_law":    gr.get("applicable_law", ""),
+        "law_summary":       gr.get("law_summary", ""),
+        "details":           gr.get("details", ""),
+        "risk_warning":      gr.get("risk_warning", ""),
+        "tax_saving":        gr.get("tax_saving", ""),
+        "confidence_pct":    conf_pct,
+        "tax_after_applied": tax_after,
+        "base_tax":          base_tax,
+        "면책안내":           "본 분석은 참고용이며, 정확한 세액은 세무사의 최종 검토가 필요합니다.",
+        "상담문의":           {"안내": "더 정확한 상담을 원하시면 아래 버튼을 눌러주세요.", "카카오톡채널": KAKAO_CHANNEL_URL}
     }
 
 # ============================================================
