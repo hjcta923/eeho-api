@@ -332,12 +332,18 @@ async def generate_questions(payload: EEHOPayload):
 추출 키워드: {키워드리스트}
 {error_context}
 적용 가능한 비과세/감면 규정과 필수 충족 요건을 구조화하세요.
+
+★ 절대 규칙: question_hint는 반드시 "예/아니오"로 답할 수 있는 이진 질문이어야 합니다.
+- 올바른 예: "혼인신고를 하셨나요?", "보유기간이 2년 이상인가요?", "실거주 기간이 2년 이상인가요?"
+- 잘못된 예: "거주기간이 얼마나 되나요?", "취득일이 언제인가요?" (개방형 질문 절대 금지)
+- 수치/기간 요건은 반드시 임계값과 함께 이진 질문으로 작성하세요.
+
 JSON만 응답:
 {{
   "적용_검토_규정": [{{"규정명": "소득세법 시행령 제155조 ...", "근거조문": "...", "적용가능성": "높음"}}],
-  "필수요건": [{{"req_name": "...", "data_field": "영문snake_case", "data_type": "boolean/number/duration/date/text", "threshold": "...", "legal_basis": "...", "priority": "critical/important/optional", "question_hint": "..."}}]
+  "필수요건": [{{"req_name": "...", "data_field": "영문snake_case", "data_type": "boolean/number/duration/date/text", "threshold": "...", "legal_basis": "...", "priority": "critical/important/optional", "question_hint": "예/아니오로 답할 수 있는 이진 질문"}}]
 }}
-필수요건 5~8개."""
+필수요건 5~8개. question_hint는 모두 이진 질문."""
 
     r1  = model.generate_content(s1_prompt)
     t1  = strip_json(r1.text)
@@ -358,15 +364,25 @@ JSON만 응답:
     needs.sort(key=lambda x: {"critical":0,"important":1,"optional":2}.get(x.get("priority",""),2))
     top = needs[:5]
 
-    # Stage 3: LLM 표적 질문 생성
+    # Stage 3: LLM 표적 질문 생성 (반드시 YES/NO 이진 질문)
     s3_prompt = f"""양도소득세 전문 세무사 AI.
 고객 상황: {llm_context}
 미확인 항목: {json.dumps(top, ensure_ascii=False, indent=2)}
-고객이 쉽게 이해할 수 있는 질문을 생성하세요.
+
+★ 절대 규칙 (위반 금지):
+1. 모든 질문은 반드시 "예/아니오"로만 답할 수 있어야 합니다.
+2. 수치·날짜·기간을 직접 묻는 개방형 질문은 절대 생성하지 마세요.
+   - 금지: "거주기간이 얼마나 되나요?", "취득일이 언제인가요?"
+   - 허용: "실거주 기간이 2년 이상인가요?", "취득일이 양도일로부터 2년 이전인가요?"
+3. threshold가 있는 요건은 그 임계값을 질문에 명시하세요.
+   - 예: threshold=2년 → "보유기간이 2년 이상인가요?"
+   - 예: threshold=1,200,000,000 → "양도가액이 12억원을 초과하나요?"
+4. 질문은 일반인이 이해하기 쉬운 평어체로 작성하세요.
+
 JSON만 응답:
 {{
   "questions": [
-    {{"id": "q1", "category": "카테고리명", "question": "질문 내용"}}
+    {{"id": "q1", "category": "카테고리명", "question": "예/아니오로 답할 수 있는 질문"}}
   ]
 }}
 정확히 {len(top)}개. id는 q1, q2, q3... 순서."""
