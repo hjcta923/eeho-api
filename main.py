@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 import json
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any
 from pinecone import Pinecone
 from google.cloud import storage
 import vertexai
@@ -72,35 +72,153 @@ def match_guide_sections(keywords, guide):
     results.sort(key=lambda x: x["매칭수"], reverse=True)
     return results[:3]
 
+# ============================================================
+# ★ 신규: 프론트엔드 JSON Payload 수신 모델
+# ============================================================
+class TaxCategory(BaseModel):
+    type: str = "모름"
+
+class AssetInfo(BaseModel):
+    asset_type: str = "모름"
+    address: str = "모름"
+    area_size: str = "모름"
+
+class PriceInfo(BaseModel):
+    buy_price: float = 0
+    sell_price: float = 0
+
+class DateInfo(BaseModel):
+    buy_date: str = "모름"
+    sell_date: str = "모름"
+
+class ConditionInfo(BaseModel):
+    is_regulated_area: str = "모름"
+    house_count: str = "모름"
+    residence_period: str = "모름"
+
+class StructuredData(BaseModel):
+    asset_info: AssetInfo = AssetInfo()
+    price_info: PriceInfo = PriceInfo()
+    date_info: DateInfo = DateInfo()
+    condition_info: ConditionInfo = ConditionInfo()
+
+class CalculatedData(BaseModel):
+    estimated_total_tax: float = 0
+    estimated_yangdo_tax: float = 0
+    estimated_local_tax: float = 0
+    estimated_surcharge: float = 0
+    estimated_acq_tax: float = 0
+    estimated_local_edu_tax: float = 0
+    estimated_rural_tax: float = 0
+    estimated_property_tax: float = 0
+    estimated_comprehensive_tax: float = 0
+    estimated_gift_tax: float = 0
+    estimated_filing_deduction: float = 0
+
+class UnstructuredData(BaseModel):
+    user_context: str = ""
+
+class EEHOPayload(BaseModel):
+    """★ 프론트엔드 buildPayload()가 생성하는 계층적 JSON과 1:1 매칭"""
+    session_id: str = ""
+    tax_category: TaxCategory = TaxCategory()
+    structured_data: StructuredData = StructuredData()
+    calculated_data: CalculatedData = CalculatedData()
+    unstructured_data: UnstructuredData = UnstructuredData()
+    # 2차 이후 추가 질문 응답 (need_more_info 루프)
+    additional_data: dict = {}
+
+# ── 기존 단순 쿼리 모델 (테스트 엔드포인트용으로 유지) ──
 class QueryRequest(BaseModel):
     question: str
 
-def lookup_prior_errors(question, top_k=2):
-    try:
-        idx = get_index()
-        results = idx.search_records(namespace="error_notes", query={"inputs": {"text": question}, "top_k": top_k})
-        return [{"note_id": hit.get("_id",""), "유사도": round(hit.get("_score",0),3), "원래질문": hit["fields"].get("original_question",""), "교훈": hit["fields"].get("교훈",""), "오류유형": hit["fields"].get("오류유형","")} for hit in results.get("result",{}).get("hits",[]) if hit.get("_score",0) > 0.5]
-    except Exception:
-        return []
+# ============================================================
+# ★ payload → 판례 검색 쿼리 문자열 생성
+# ============================================================
+def build_search_query(payload: EEHOPayload) -> str:
+    """
+    structured_data + user_context를 합쳐 자연어 검색 쿼리를 구성.
+    백엔드 Pinecone 시맨틱 검색의 정확도를 높이는 핵심 변환 함수.
+    """
+    parts = []
+    sd = payload.structured_data
+    ci = sd.condition_info
 
-@app.get("/")
-def health():
-    return {"service": "EEHO AI API", "version": "0.5", "status": "running"}
+    # 세목
+    if payload.tax_category.type and payload.tax_category.type != "모름":
+        parts.append(payload.tax_category.type)
 
-@app.post("/analyze")
-async def analyze(req: QueryRequest):
-    idx = get_index()
-    search_results = idx.search_records(namespace="tax_cases", query={"inputs": {"text": req.question}, "top_k": 3})
-    판례목록, 전체키워드 = [], set()
-    for hit in search_results["result"]["hits"]:
-        판례목록.append({"사건번호": hit["fields"].get("사건번호",""), "주제": hit["fields"].get("주제",""), "결과": hit["fields"].get("결과",""), "유사도": round(hit["_score"],3), "판단근거": hit["fields"].get("판단근거",""), "관련법령": hit["fields"].get("관련법령",""), "과세관청주장": hit["fields"].get("과세관청주장","")})
-        전체키워드.update(extract_keywords_from_case(hit["fields"]))
-    키워드리스트 = list(전체키워드)
-    매칭결과 = match_guide_sections(키워드리스트, load_guide())
-    참조섹션 = [{"섹션": m["섹션"], "챕터": m["챕터"], "페이지": m["페이지"], "파일명": m["파일명"], "매칭키워드": m["매칭키워드"]} for m in 매칭결과]
-    prior_errors = lookup_prior_errors(req.question)
-    return {"질문": req.question, "step1_판례검색": 판례목록, "step2_추출키워드": 키워드리스트, "step3_실무서매칭": 매칭결과, "step4_참조섹션": 참조섹션, "step0_오답노트_선행참조": prior_errors}
+    # 자산 유형 / 주소
+    if sd.asset_info.asset_type not in ["모름", ""]:
+        parts.append(sd.asset_info.asset_type)
+    if sd.asset_info.address not in ["모름", ""]:
+        parts.append(sd.asset_info.address)
 
+    # 조건 정보
+    if ci.house_count not in ["모름", ""]:
+        parts.append(f"{ci.house_count} 보유")
+    if ci.is_regulated_area == "여":
+        parts.append("조정대상지역")
+    if ci.residence_period not in ["모름", "없음", ""]:
+        parts.append(f"거주기간 {ci.residence_period}")
+
+    # 가격 (고가주택 여부 판단용)
+    sell = sd.price_info.sell_price
+    if sell > 1_200_000_000:
+        parts.append("고가주택 12억 초과")
+    elif sell > 0:
+        parts.append(f"양도가액 {int(sell/100000000)}억원대")
+
+    # 사용자 자유 입력 (가장 중요 — 뒤에 붙여서 가중치↑)
+    user_ctx = payload.unstructured_data.user_context.strip()
+    if user_ctx:
+        parts.append(user_ctx)
+
+    return " ".join(parts) if parts else "양도소득세 비과세 감면"
+
+# ============================================================
+# ★ payload → LLM 컨텍스트 블록 생성
+# ============================================================
+def build_llm_context(payload: EEHOPayload) -> str:
+    """
+    LLM 프롬프트에 삽입할 사용자 상황 요약.
+    calculated_data의 1차 예상세액을 포함해 절세 비교 기준점을 명시.
+    """
+    sd = payload.structured_data
+    cd = payload.calculated_data
+    ci = sd.condition_info
+
+    lines = [
+        f"[세목] {payload.tax_category.type}",
+        f"[자산] {sd.asset_info.asset_type} | 주소: {sd.asset_info.address} | 면적: {sd.asset_info.area_size}",
+        f"[가격] 취득가: {int(sd.price_info.buy_price):,}원 / 양도가: {int(sd.price_info.sell_price):,}원",
+        f"[날짜] 취득일: {sd.date_info.buy_date} / 양도일: {sd.date_info.sell_date}",
+        f"[조건] 조정지역: {ci.is_regulated_area} | 주택 수: {ci.house_count} | 거주기간: {ci.residence_period}",
+    ]
+
+    # 1차 예상세액 — AI 리포트의 절세 비교 기준점
+    if cd.estimated_total_tax > 0:
+        lines.append(
+            f"[1차 예상세액] 총 {int(cd.estimated_total_tax):,}원"
+            f" (양도소득세 {int(cd.estimated_yangdo_tax):,}원"
+            f" + 지방소득세 {int(cd.estimated_local_tax):,}원"
+            + (f" + 중과가산 {int(cd.estimated_surcharge):,}원" if cd.estimated_surcharge > 0 else "")
+            + ")"
+        )
+
+    # 사용자 자유 입력
+    if payload.unstructured_data.user_context:
+        lines.append(f"[사용자 상황] {payload.unstructured_data.user_context}")
+
+    # 2차 이상 추가 응답
+    if payload.additional_data:
+        lines.append(f"[추가 답변] {json.dumps(payload.additional_data, ensure_ascii=False)}")
+
+    return "\n".join(lines)
+
+# ============================================================
+# Gap Detection (기존 로직 그대로 유지)
+# ============================================================
 class GapResult(BaseModel):
     req_name: str; data_field: str; status: str; user_value: str = ""; threshold: str = ""; legal_basis: str = ""; priority: str = ""; question_hint: str = ""
 
@@ -153,25 +271,114 @@ def run_gap_detection(ai_requirements, user_data, provisions_checked=None):
     total = len(ai_requirements)
     return GapAnalysisResult(provisions_checked=provisions_checked or [], total_requirements=total, satisfied_count=len(satisfied_items), gap_count=len(gap_items), ambiguous_count=len(ambiguous_items), completeness_ratio=round(len(satisfied_items)/total,2) if total>0 else 0, gap_items=gap_items, ambiguous_items=ambiguous_items, satisfied_items=satisfied_items)
 
+# ============================================================
+# 오답 노트 선행 참조
+# ============================================================
+def lookup_prior_errors(question, top_k=2):
+    try:
+        idx = get_index()
+        results = idx.search_records(namespace="error_notes", query={"inputs": {"text": question}, "top_k": top_k})
+        return [{"note_id": hit.get("_id",""), "유사도": round(hit.get("_score",0),3), "원래질문": hit["fields"].get("original_question",""), "교훈": hit["fields"].get("교훈",""), "오류유형": hit["fields"].get("오류유형","")} for hit in results.get("result",{}).get("hits",[]) if hit.get("_score",0) > 0.5]
+    except Exception:
+        return []
+
+# ============================================================
+# 헬스 체크
+# ============================================================
+@app.get("/")
+def health():
+    return {"service": "EEHO AI API", "version": "0.5", "status": "running"}
+
+# ============================================================
+# ★ /analyze — 프론트엔드 EEHOPayload 수신
+# ============================================================
+@app.post("/analyze")
+async def analyze(payload: EEHOPayload):
+    """
+    Phase 1: 판례 검색 + 실무서 매칭 + 오답 노트 선행 참조
+    프론트엔드의 buildPayload() 결과를 직접 수신.
+    """
+    search_query = build_search_query(payload)
+    llm_context = build_llm_context(payload)
+
+    idx = get_index()
+    search_results = idx.search_records(
+        namespace="tax_cases",
+        query={"inputs": {"text": search_query}, "top_k": 3},
+    )
+
+    판례목록, 전체키워드 = [], set()
+    for hit in search_results["result"]["hits"]:
+        판례목록.append({
+            "사건번호": hit["fields"].get("사건번호", ""),
+            "주제": hit["fields"].get("주제", ""),
+            "결과": hit["fields"].get("결과", ""),
+            "유사도": round(hit["_score"], 3),
+            "판단근거": hit["fields"].get("판단근거", ""),
+            "관련법령": hit["fields"].get("관련법령", ""),
+            "과세관청주장": hit["fields"].get("과세관청주장", ""),
+        })
+        전체키워드.update(extract_keywords_from_case(hit["fields"]))
+
+    키워드리스트 = list(전체키워드)
+    매칭결과 = match_guide_sections(키워드리스트, load_guide())
+    참조섹션 = [{"섹션": m["섹션"], "챕터": m["챕터"], "페이지": m["페이지"], "파일명": m["파일명"], "매칭키워드": m["매칭키워드"]} for m in 매칭결과]
+    prior_errors = lookup_prior_errors(search_query)
+
+    return {
+        "session_id": payload.session_id,
+        "검색_쿼리": search_query,         # 디버깅용
+        "llm_컨텍스트": llm_context,       # 디버깅용
+        "step1_판례검색": 판례목록,
+        "step2_추출키워드": 키워드리스트,
+        "step3_실무서매칭": 매칭결과,
+        "step4_참조섹션": 참조섹션,
+        "step0_오답노트_선행참조": prior_errors,
+        # 하위 단계 호출을 위해 payload 핵심 정보 그대로 전달
+        "_payload_echo": {
+            "tax_category": payload.tax_category.model_dump(),
+            "structured_data": payload.structured_data.model_dump(),
+            "calculated_data": payload.calculated_data.model_dump(),
+            "unstructured_data": payload.unstructured_data.model_dump(),
+        }
+    }
+
+# ============================================================
+# ★ /generate-questions — 프론트엔드 EEHOPayload 수신
+# ============================================================
 @app.post("/generate-questions")
-async def generate_questions(req: QueryRequest):
-    phase1 = await analyze(req)
+async def generate_questions(payload: EEHOPayload):
+    """
+    3-Stage Gap Analysis Pipeline
+    Stage1: LLM 동적 요건 추출
+    Stage2: 결정론적 Gap Detection (LLM 없음)
+    Stage3: LLM 표적 질문 생성
+    """
+    phase1 = await analyze(payload)
     model = get_gemini()
+    llm_context = phase1["llm_컨텍스트"]
+
     prior_errors = phase1.get("step0_오답노트_선행참조", [])
     error_context = ""
     if prior_errors:
-        lessons = [e.get("교훈","") for e in prior_errors if e.get("교훈")]
-        if lessons: error_context = f"\n[주의] 과거 유사 사례 오류 교훈:\n{json.dumps(lessons, ensure_ascii=False)}\n"
+        lessons = [e.get("교훈", "") for e in prior_errors if e.get("교훈")]
+        if lessons:
+            error_context = f"\n[주의] 과거 유사 사례 오류 교훈 (반드시 반영):\n{json.dumps(lessons, ensure_ascii=False)}\n"
 
-    s1p = f'''당신은 양도소득세 전문 세무사입니다.
-고객 질문: "{req.question}"
-관련 판례: {json.dumps(phase1["step1_판례검색"], ensure_ascii=False, indent=2)}
+    # ── Stage 1: LLM 동적 요건 추출 ──
+    s1p = f"""당신은 양도소득세 전문 세무사입니다.
+고객 상황:
+{llm_context}
+
+관련 판례:
+{json.dumps(phase1["step1_판례검색"], ensure_ascii=False, indent=2)}
+
 추출 키워드: {phase1["step2_추출키워드"]}
 {error_context}
-적용 가능 비과세/감면 규정과 필수 충족 요건을 구조화하세요.
+위 상황에 적용 가능한 비과세/감면 규정과 필수 충족 요건을 구조화하세요.
 JSON만 응답:
-{{"적용_검토_규정": [{{"규정명": "...", "근거조문": "...", "적용가능성": "높음"}}], "필수요건": [{{"req_name": "...", "data_field": "영문snake", "data_type": "boolean/number/duration/date/text", "threshold": "...", "legal_basis": "...", "priority": "critical/important/optional", "question_hint": "..."}}]}}
-필수요건 5~8개.'''
+{{"적용_검토_규정": [{{"규정명": "...", "근거조문": "...", "적용가능성": "높음"}}], "필수요건": [{{"req_name": "...", "data_field": "영문snake_case", "data_type": "boolean/number/duration/date/text", "threshold": "...", "legal_basis": "...", "priority": "critical/important/optional", "question_hint": "..."}}]}}
+필수요건 5~8개."""
 
     r1 = model.generate_content(s1p)
     t1 = r1.text.strip()
@@ -179,23 +386,30 @@ JSON만 응답:
         t1 = t1.split("```")[1]
         if t1.startswith("json"): t1 = t1[4:]
         t1 = t1.strip()
-    try: s1r = json.loads(t1)
-    except: return {"질문": req.question, "stage": "stage1_error", "error": t1[:500]}
+    try:
+        s1r = json.loads(t1)
+    except:
+        return {"session_id": payload.session_id, "stage": "stage1_error", "error": t1[:500]}
 
     reqs = s1r.get("필수요건", [])
     provs = s1r.get("적용_검토_규정", [])
-    gap = run_gap_detection(reqs, {}, [p.get("규정명","") for p in provs])
+
+    # ── Stage 2: 결정론적 Gap Detection ──
+    # structured_data를 flatten하여 Gap Detection에 전달
+    user_data_flat = payload.structured_data.model_dump()
+    gap = run_gap_detection(reqs, user_data_flat, [p.get("규정명", "") for p in provs])
 
     needs = gap.gap_items + gap.ambiguous_items
-    needs.sort(key=lambda x: {"critical":0,"important":1,"optional":2}.get(x.get("priority",""),2))
+    needs.sort(key=lambda x: {"critical": 0, "important": 1, "optional": 2}.get(x.get("priority", ""), 2))
     top = needs[:5]
 
-    s3p = f'''양도소득세 전문 세무사 AI. 고객 질문: "{req.question}"
-미확인 항목: {json.dumps(top, ensure_ascii=False, indent=2)}
+    # ── Stage 3: LLM 표적 질문 생성 ──
+    s3p = f"""양도소득세 전문 세무사 AI. 고객 상황: {llm_context}
+미확인/모름 항목: {json.dumps(top, ensure_ascii=False, indent=2)}
 각 항목에 대해 고객이 이해하기 쉬운 질문 생성.
 JSON만 응답:
 {{"체크리스트": [{{"질문": "...", "카테고리": "...", "중요도": "필수", "근거조문": "...", "설명": "...", "입력형식": "Yes/No/금액/날짜/기간/선택"}}]}}
-{len(top)}개 질문 생성.'''
+{len(top)}개 질문 생성."""
 
     r3 = model.generate_content(s3p)
     t3 = r3.text.strip()
@@ -203,11 +417,28 @@ JSON만 응답:
         t3 = t3.split("```")[1]
         if t3.startswith("json"): t3 = t3[4:]
         t3 = t3.strip()
-    try: s3r = json.loads(t3)
-    except: s3r = {"raw": t3, "parse_error": True}
+    try:
+        s3r = json.loads(t3)
+    except:
+        s3r = {"raw": t3, "parse_error": True}
 
-    return {"질문": req.question, "stage1_적용규정": provs, "stage1_필수요건_수": len(reqs), "stage2_gap_analysis": gap.model_dump(), "stage3_추가질문": s3r, "오답노트_선행참조": prior_errors, "판례검색": phase1["step1_판례검색"], "추출키워드": phase1["step2_추출키워드"], "참조섹션": phase1["step4_참조섹션"]}
+    return {
+        "session_id": payload.session_id,
+        "stage1_적용규정": provs,
+        "stage1_필수요건_수": len(reqs),
+        "stage2_gap_analysis": gap.model_dump(),
+        "stage3_추가질문": s3r,
+        "오답노트_선행참조": prior_errors,
+        "판례검색": phase1["step1_판례검색"],
+        "추출키워드": phase1["step2_추출키워드"],
+        "참조섹션": phase1["step4_참조섹션"],
+        # ★ 프론트엔드가 다음 단계(/confirm)로 넘겨야 할 데이터
+        "calculated_data": payload.calculated_data.model_dump(),
+    }
 
+# ============================================================
+# HITL — /confirm, /report (기존 로직 유지, session_id 추가)
+# ============================================================
 class DataQualityMetrics(BaseModel):
     completeness_before: float = Field(..., ge=0.0, le=1.0); completeness_after: float = Field(..., ge=0.0, le=1.0); quality_delta: float; human_corrections_count: int = Field(..., ge=0); preprocessing_type: str = "human_in_the_loop_validation"
 
@@ -215,7 +446,16 @@ class FieldDiff(BaseModel):
     field_name: str; ai_generated_value: str; user_confirmed_value: str; modification_type: str; impact_on_analysis: str = ""
 
 class ConfirmRequest(BaseModel):
-    question: str; 체크리스트응답: list; 추가정보: dict = {}; 판례검색: list = []; 추출키워드: list = []; 참조섹션: list = []; 사용자수정사항: list = []
+    session_id: str = ""
+    question: str
+    체크리스트응답: list
+    추가정보: dict = {}
+    판례검색: list = []
+    추출키워드: list = []
+    참조섹션: list = []
+    사용자수정사항: list = []
+    # ★ 1차 예상세액 (절세 비교 기준점)
+    calculated_data: dict = {}
 
 def compute_data_quality(cl, ei, uc):
     tc = len(cl) if cl else 1
@@ -237,17 +477,36 @@ def compute_data_quality(cl, ei, uc):
 @app.post("/confirm")
 async def confirm(req: ConfirmRequest):
     qm, fd = compute_data_quality(req.체크리스트응답, req.추가정보, req.사용자수정사항)
-    pp = {"pipeline_stage": "human_in_the_loop_preprocessing", "timestamp": datetime.utcnow().isoformat(), "data_quality": qm.model_dump(), "field_diffs": [d.model_dump() for d in fd], "summary": {"총_입력_필드": len(req.체크리스트응답)+len(req.추가정보), "사용자_수정_건수": qm.human_corrections_count, "품질_개선_폭": qm.quality_delta, "판정": "AI 판단 수용" if qm.human_corrections_count==0 else f"사용자 보정 {qm.human_corrections_count}건 반영"}}
+    pp = {
+        "pipeline_stage": "human_in_the_loop_preprocessing",
+        "timestamp": datetime.utcnow().isoformat(),
+        "data_quality": qm.model_dump(),
+        "field_diffs": [d.model_dump() for d in fd],
+        "summary": {
+            "총_입력_필드": len(req.체크리스트응답)+len(req.추가정보),
+            "사용자_수정_건수": qm.human_corrections_count,
+            "품질_개선_폭": qm.quality_delta,
+            "판정": "AI 판단 수용" if qm.human_corrections_count==0 else f"사용자 보정 {qm.human_corrections_count}건 반영"
+        }
+    }
     cc = ""
-    if req.사용자수정사항: cc = f"\n[중요] 사용자 수정:\n{json.dumps(req.사용자수정사항, ensure_ascii=False, indent=2)}\n"
+    if req.사용자수정사항:
+        cc = f"\n[중요] 사용자 수정:\n{json.dumps(req.사용자수정사항, ensure_ascii=False, indent=2)}\n"
+
+    # ★ 1차 예상세액 컨텍스트 — 절세 비교 기준점
+    tax_ctx = ""
+    cd = req.calculated_data
+    if cd.get("estimated_total_tax", 0) > 0:
+        tax_ctx = f"\n[1차 예상세액] 총 {int(cd['estimated_total_tax']):,}원 (절세 시 비교 기준)\n"
+
     model = get_gemini()
-    p = f'''양도소득세 전문 세무사 AI.
+    p = f"""양도소득세 전문 세무사 AI.
 고객 질문: "{req.question}"
 체크리스트: {json.dumps(req.체크리스트응답, ensure_ascii=False, indent=2)}
 추가정보: {json.dumps(req.추가정보, ensure_ascii=False, indent=2)}
-{cc}판례: {json.dumps(req.판례검색[:1], ensure_ascii=False, indent=2)}
+{cc}{tax_ctx}판례: {json.dumps(req.판례검색[:1], ensure_ascii=False, indent=2)}
 사실관계를 세법 관점에서 정리. JSON만 응답:
-{{"사실관계_요약": {{"양도자_현황": "...", "주택_현황": "...", "합가_현황": "...", "기타": "..."}}, "적용_검토_조문": [{{"조문": "...", "내용": "...", "충족여부": "충족/미충족/확인필요", "판단근거": "..."}}], "비과세_가능성": "높음/보통/낮음", "비과세_가능성_설명": "..."}}'''
+{{"사실관계_요약": {{"양도자_현황": "...", "주택_현황": "...", "합가_현황": "...", "기타": "..."}}, "적용_검토_조문": [{{"조문": "...", "내용": "...", "충족여부": "충족/미충족/확인필요", "판단근거": "..."}}], "비과세_가능성": "높음/보통/낮음", "비과세_가능성_설명": "..."}}"""
     r = model.generate_content(p)
     t = r.text.strip()
     if t.startswith("```"):
@@ -256,27 +515,49 @@ async def confirm(req: ConfirmRequest):
         t = t.strip()
     try: gr = json.loads(t)
     except: gr = {"raw": t, "parse_error": True}
-    return {"질문": req.question, "preprocessing": pp, "사실관계": gr, "안내": "위 사실관계가 맞으면 확인 버튼을 눌러 최종 리포트를 생성합니다."}
+    return {"session_id": req.session_id, "질문": req.question, "preprocessing": pp, "사실관계": gr, "안내": "위 사실관계가 맞으면 확인 버튼을 눌러 최종 리포트를 생성합니다."}
 
 class ReportRequest(BaseModel):
-    question: str; 사실관계: dict; 체크리스트응답: list; 추가정보: dict = {}; 판례검색: list = []; 추출키워드: list = []; 참조섹션: list = []; preprocessing: dict = {}
+    session_id: str = ""
+    question: str
+    사실관계: dict
+    체크리스트응답: list
+    추가정보: dict = {}
+    판례검색: list = []
+    추출키워드: list = []
+    참조섹션: list = []
+    preprocessing: dict = {}
+    # ★ 1차 예상세액 — 리포트에서 "절세 효과" 수치로 활용
+    calculated_data: dict = {}
 
 @app.post("/report")
 async def report(req: ReportRequest):
     model = get_gemini()
     qc = ""
     if req.preprocessing:
-        dq = req.preprocessing.get("data_quality",{})
+        dq = req.preprocessing.get("data_quality", {})
         qc = f"\n[데이터 품질] 사용자 검증 완료, 수정 {dq.get('human_corrections_count',0)}건\n"
-    p = f'''양도소득세 전문 세무사 AI. 최종 리포트 작성.
+
+    # ★ 핵심: 1차 예상세액을 리포트 절세 비교 기준으로 명시
+    cd = req.calculated_data
+    tax_baseline = ""
+    if cd.get("estimated_total_tax", 0) > 0:
+        tax_baseline = (
+            f"\n[절세 비교 기준] 현재 예상 세액 {int(cd['estimated_total_tax']):,}원"
+            f" (양도소득세 {int(cd.get('estimated_yangdo_tax',0)):,}원"
+            f" + 지방소득세 {int(cd.get('estimated_local_tax',0)):,}원)"
+            f"\n→ 비과세/감면 적용 시 절감액을 반드시 수치로 제시할 것.\n"
+        )
+
+    p = f"""양도소득세 전문 세무사 AI. 최종 리포트 작성.
 질문: "{req.question}"
 사실관계: {json.dumps(req.사실관계, ensure_ascii=False, indent=2)}
 체크리스트: {json.dumps(req.체크리스트응답, ensure_ascii=False, indent=2)}
 추가정보: {json.dumps(req.추가정보, ensure_ascii=False, indent=2)}
 판례: {json.dumps(req.판례검색, ensure_ascii=False, indent=2)}
 실무서: {json.dumps(req.참조섹션, ensure_ascii=False, indent=2)}
-{qc}JSON만 응답:
-{{"예상세액": {{"비과세_적용시": "0원", "비과세_미적용시": "약 OOO만원"}}, "판단근거": [{{"조문": "...", "내용": "...", "판단": "..."}}], "관련예판": [{{"사건번호": "...", "결과": "...", "시사점": "..."}}], "리스크": [{{"유형": "...", "내용": "...", "대응방안": "..."}}], "분석_신뢰도": "높음/보통/낮음", "종합의견": "..."}}'''
+{qc}{tax_baseline}JSON만 응답:
+{{"예상세액": {{"비과세_적용시": "0원", "비과세_미적용시": "약 OOO만원", "절세_효과": "약 OOO만원 절감"}}, "판단근거": [{{"조문": "...", "내용": "...", "판단": "..."}}], "관련예판": [{{"사건번호": "...", "결과": "...", "시사점": "..."}}], "리스크": [{{"유형": "...", "내용": "...", "대응방안": "..."}}], "분석_신뢰도": "높음/보통/낮음", "종합의견": "..."}}"""
     r = model.generate_content(p)
     t = r.text.strip()
     if t.startswith("```"):
@@ -285,8 +566,17 @@ async def report(req: ReportRequest):
         t = t.strip()
     try: gr = json.loads(t)
     except: gr = {"raw": t, "parse_error": True}
-    return {"리포트": gr, "preprocessing_metadata": req.preprocessing or None, "면책안내": "본 분석은 참고용이며, 정확한 세액은 세무사의 최종 검토가 필요합니다.", "상담문의": {"안내": "보다 정확한 상담을 원하시면 아래 버튼을 눌러주세요.", "카카오톡채널": KAKAO_CHANNEL_URL}}
+    return {
+        "session_id": req.session_id,
+        "리포트": gr,
+        "preprocessing_metadata": req.preprocessing or None,
+        "면책안내": "본 분석은 참고용이며, 정확한 세액은 세무사의 최종 검토가 필요합니다.",
+        "상담문의": {"안내": "보다 정확한 상담을 원하시면 아래 버튼을 눌러주세요.", "카카오톡채널": KAKAO_CHANNEL_URL}
+    }
 
+# ============================================================
+# /feedback (기존 그대로 유지)
+# ============================================================
 class FeedbackRequest(BaseModel):
     session_id: str = ""; question: str; feedback_text: str; ai_report: dict = {}; ai_사실관계: dict = {}; 추출키워드: list = []
 
@@ -298,13 +588,13 @@ class ErrorNote(BaseModel):
 
 async def triage_feedback(feedback_text, question, ai_report):
     model = get_gemini()
-    p = f'''세무 AI 품질관리 분석가.
-사용자가 "보완하기" 후 피드백:
+    p = f"""세무 AI 품질관리 분석가.
+사용자 피드백:
 [질문] "{question}"
 [AI 리포트] {json.dumps(ai_report, ensure_ascii=False)[:2000]}
 [피드백] "{feedback_text}"
 판정: actionable(사실오류/누락보충/법령이의), emotional(감정만), ambiguous(불명확)
-JSON만: {{"classification": "...", "confidence": 0.85, "reason": "...", "has_factual_correction": true, "has_missing_info": false, "has_legal_dispute": false}}'''
+JSON만: {{"classification": "...", "confidence": 0.85, "reason": "...", "has_factual_correction": true, "has_missing_info": false, "has_legal_dispute": false}}"""
     r = model.generate_content(p)
     t = r.text.strip()
     if t.startswith("```"):
@@ -316,13 +606,13 @@ JSON만: {{"classification": "...", "confidence": 0.85, "reason": "...", "has_fa
 
 async def extract_deltas(feedback_text, question, ai_report, ai_사실관계):
     model = get_gemini()
-    p = f'''세무 AI 오류 분석가.
+    p = f"""세무 AI 오류 분석가.
 [질문] "{question}"
 [AI 사실관계] {json.dumps(ai_사실관계, ensure_ascii=False)[:2000]}
 [AI 리포트] {json.dumps(ai_report, ensure_ascii=False)[:2000]}
 [피드백] "{feedback_text}"
-AI 오류를 구조화. JSON만:
-{{"deltas": [{{"error_field": "...", "ai_judgment": "...", "user_correction": "...", "lesson_learned": "...", "error_type": "factual_error/missing_info/legal_interpretation/other"}}], "embed_summary": "벡터검색용 1~2문장 요약"}}'''
+JSON만:
+{{"deltas": [{{"error_field": "...", "ai_judgment": "...", "user_correction": "...", "lesson_learned": "...", "error_type": "factual_error/missing_info/legal_interpretation/other"}}], "embed_summary": "벡터검색용 1~2문장 요약"}}"""
     r = model.generate_content(p)
     t = r.text.strip()
     if t.startswith("```"):
@@ -379,13 +669,34 @@ async def feedback(req: FeedbackRequest):
     result["안내"] = "소중한 의견이 반영되었습니다. 향후 유사 사례 분석 시 더 나은 결과를 제공하겠습니다."
     return result
 
+# ============================================================
+# 테스트 엔드포인트 (기존 유지 + 새 payload 테스트 추가)
+# ============================================================
 @app.get("/test")
 async def test():
-    return await analyze(QueryRequest(question="부모님을 모시려고 합가했는데 아파트를 팔면 비과세 되나요?"))
+    """기존 문자열 쿼리 방식 테스트 (내부 호환)"""
+    dummy = EEHOPayload(
+        session_id="test_session_001",
+        tax_category=TaxCategory(type="양도소득세"),
+        unstructured_data=UnstructuredData(user_context="부모님을 모시려고 합가했는데 아파트를 팔면 비과세 되나요?")
+    )
+    return await analyze(dummy)
 
 @app.get("/test-questions")
 async def test_questions():
-    return await generate_questions(QueryRequest(question="부모님을 모시려고 합가했는데 아파트를 팔면 비과세 되나요?"))
+    dummy = EEHOPayload(
+        session_id="test_session_001",
+        tax_category=TaxCategory(type="양도소득세"),
+        structured_data=StructuredData(
+            asset_info=AssetInfo(asset_type="아파트", address="서울시 강남구 역삼동 123-45", area_size="85㎡ 이하"),
+            price_info=PriceInfo(buy_price=500000000, sell_price=1500000000),
+            date_info=DateInfo(buy_date="2015-05-20", sell_date="2026-04-10"),
+            condition_info=ConditionInfo(is_regulated_area="여", house_count="1주택", residence_period="2년+")
+        ),
+        calculated_data=CalculatedData(estimated_total_tax=187200000, estimated_yangdo_tax=144000000, estimated_local_tax=14400000, estimated_surcharge=28800000),
+        unstructured_data=UnstructuredData(user_context="올해 결혼을 하면서 2주택이 되었어요. 기존 아파트는 언제 팔아야 하나요?")
+    )
+    return await generate_questions(dummy)
 
 @app.get("/test-gap")
 async def test_gap():
@@ -395,7 +706,7 @@ async def test_gap():
 
 @app.get("/test-confirm")
 async def test_confirm():
-    return await confirm(ConfirmRequest(question="부모님을 모시려고 합가했는데 아파트를 팔면 비과세 되나요?",체크리스트응답=[{"질문":"합가로 인해 일시적으로 2주택이 된 경우인가요?","답변":"Yes"},{"질문":"합가일로부터 5년 이내에 양도하는 것인가요?","답변":"Yes"},{"질문":"양도하는 주택이 유일한 주택이었을 때 합가한 것인가요?","답변":"Yes"}],추가정보={"양도가액":"800000000","취득가액":"500000000"},판례검색=[{"사건번호":"조심-2015-전-4851","주제":"1세대 1주택 비과세","결과":"기각"}],추출키워드=["동거봉양","합가","비과세"],참조섹션=[{"섹션":"제4절 1세대 2주택 비과세 특례","페이지":"749-898"}],사용자수정사항=[{"필드":"보유기간","AI값":"2년","수정값":"3년 6개월","영향":"장기보유특별공제율 변경"},{"필드":"합가사유","AI값":"동거봉양","수정값":"동거봉양"},{"필드":"거주기간","AI값":"","수정값":"2년 이상","영향":"거주 요건 충족 여부"}]))
+    return await confirm(ConfirmRequest(session_id="test_002", question="부모님을 모시려고 합가했는데 아파트를 팔면 비과세 되나요?",체크리스트응답=[{"질문":"합가로 인해 일시적으로 2주택이 된 경우인가요?","답변":"Yes"},{"질문":"합가일로부터 5년 이내에 양도하는 것인가요?","답변":"Yes"},{"질문":"양도하는 주택이 유일한 주택이었을 때 합가한 것인가요?","답변":"Yes"}],추가정보={"양도가액":"800000000","취득가액":"500000000"},판례검색=[{"사건번호":"조심-2015-전-4851","주제":"1세대 1주택 비과세","결과":"기각"}],추출키워드=["동거봉양","합가","비과세"],참조섹션=[{"섹션":"제4절 1세대 2주택 비과세 특례","페이지":"749-898"}],사용자수정사항=[{"필드":"보유기간","AI값":"2년","수정값":"3년 6개월","영향":"장기보유특별공제율 변경"},{"필드":"합가사유","AI값":"동거봉양","수정값":"동거봉양"},{"필드":"거주기간","AI값":"","수정값":"2년 이상","영향":"거주 요건 충족 여부"}],calculated_data={"estimated_total_tax":187200000,"estimated_yangdo_tax":144000000,"estimated_local_tax":14400000}))
 
 @app.get("/test-feedback-actionable")
 async def test_feedback_actionable():
