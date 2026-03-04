@@ -290,6 +290,122 @@ def health():
     return {"service": "EEHO AI API", "version": "0.5", "status": "running"}
 
 # ============================================================
+# ★ POST / — 프론트엔드 단일 진입점 (통합 오케스트레이션)
+# ============================================================
+# 프론트엔드 calculator.js의 callAPI()는 EEHO_API_URL(루트)로 POST.
+# 이 엔드포인트가 전체 파이프라인을 오케스트레이션하고
+# 프론트가 기대하는 { status: "need_more_info" | "success" } 형식으로 반환.
+# ============================================================
+@app.post("/")
+async def ai_unified(payload: EEHOPayload):
+    """
+    통합 AI 오케스트레이션 엔드포인트.
+    프론트엔드가 기대하는 응답 형식:
+      - { status: "need_more_info", message, missing_variables, checklist }
+      - { status: "success", result_type: "PASS"|"FAIL", details, risk_warning, full_report }
+    """
+    # ── Phase 1+2: Gap Analysis ──
+    phase2 = await generate_questions(payload)
+    gap = phase2.get("stage2_gap_analysis", {})
+    completeness = gap.get("completeness_ratio", 0.0)
+    questions = phase2.get("stage3_추가질문", {}).get("체크리스트", [])
+    판례 = phase2.get("판례검색", [])
+    키워드 = phase2.get("추출키워드", [])
+    섹션 = phase2.get("참조섹션", [])
+
+    # ── Gap 판정: 미입력 항목이 남아있고 additional_data가 비어있으면 추가질문 ──
+    has_critical_gaps = gap.get("gap_count", 0) > 0
+    has_additional = bool(payload.additional_data)
+
+    if has_critical_gaps and not has_additional and questions:
+        missing_vars = [item.get("data_field", "") for item in gap.get("gap_items", [])][:4]
+        return {
+            "status": "need_more_info",
+            "message": "정확한 분석을 위해 추가 정보가 필요합니다.",
+            "checklist": questions,          # 프론트 handleNeedMoreInfo 형식 B
+            "missing_variables": missing_vars,
+        }
+
+    # ── Phase 3: Confirm (HITL 전처리 + 사실관계 정리) ──
+    llm_context = build_llm_context(payload)
+    user_question = payload.unstructured_data.user_context or llm_context
+
+    # additional_data를 추가정보로 병합
+    extra_info = dict(payload.additional_data) if payload.additional_data else {}
+
+    confirm_req = ConfirmRequest(
+        session_id=payload.session_id,
+        question=user_question,
+        체크리스트응답=[
+            {"질문": q.get("질문", ""), "답변": "확인"}
+            for q in questions
+        ],
+        추가정보=extra_info,
+        판례검색=판례,
+        추출키워드=키워드,
+        참조섹션=섹션,
+        사용자수정사항=[],
+        calculated_data=payload.calculated_data.model_dump(),
+    )
+    confirm_result = await confirm(confirm_req)
+
+    # ── Phase 4: Report 생성 ──
+    report_req = ReportRequest(
+        session_id=payload.session_id,
+        question=user_question,
+        사실관계=confirm_result.get("사실관계", {}),
+        체크리스트응답=confirm_req.체크리스트응답,
+        추가정보=extra_info,
+        판례검색=판례,
+        추출키워드=키워드,
+        참조섹션=섹션,
+        preprocessing=confirm_result.get("preprocessing", {}),
+        calculated_data=payload.calculated_data.model_dump(),
+    )
+    report_result = await report(report_req)
+
+    # ── 프론트엔드 success 형식으로 매핑 ──
+    리포트 = report_result.get("리포트", {})
+    사실관계 = confirm_result.get("사실관계", {})
+    비과세가능성 = 사실관계.get("비과세_가능성", "보통")
+    is_pass = 비과세가능성 == "높음"
+
+    # details: 종합의견 + 판단근거 요약
+    판단근거_lines = [
+        f"[{j.get('조문','')}] {j.get('판단','')}"
+        for j in 리포트.get("판단근거", [])
+    ]
+    details_text = 리포트.get("종합의견", "")
+    if 판단근거_lines:
+        details_text += "\n\n" + "\n".join(판단근거_lines)
+
+    # risk_warning: 리스크 항목 요약
+    risk_lines = [
+        f"⚠ [{r.get('유형','')}] {r.get('내용','')} → {r.get('대응방안','')}"
+        for r in 리포트.get("리스크", [])
+    ]
+    risk_text = "\n".join(risk_lines)
+
+    # 절세 효과 수치 (기존 예상세액 vs 비과세 시)
+    예상세액 = 리포트.get("예상세액", {})
+
+    return {
+        "status": "success",
+        "result_type": "PASS" if is_pass else "FAIL",
+        "details": details_text,
+        "risk_warning": risk_text,
+        # 프론트 handleSuccess 형식 B 호환 (final_alias)
+        "final_alias": 사실관계.get("비과세_가능성_설명", ""),
+        # 절세 비교 수치
+        "tax_before": payload.calculated_data.estimated_total_tax,
+        "tax_after_label": 예상세액.get("비과세_적용시", ""),
+        "tax_savings_label": 예상세액.get("절세_효과", ""),
+        # 전체 리포트 (향후 상세 UI 확장용)
+        "full_report": report_result,
+        "session_id": payload.session_id,
+    }
+
+# ============================================================
 # ★ /analyze — 프론트엔드 EEHOPayload 수신
 # ============================================================
 @app.post("/analyze")
