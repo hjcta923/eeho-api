@@ -16,6 +16,15 @@ from vertexai.generative_models import GenerativeModel
 
 app = FastAPI(title="EEHO AI API", version="1.0")
 
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://eehotax.com", "https://www.eehotax.com", "http://localhost"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ============================================================
 # 환경변수
 # ============================================================
